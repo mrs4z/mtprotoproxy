@@ -1130,8 +1130,9 @@ async def handle_fake_tls_handshake(handshake, reader, writer, peer):
     sess_id_len = handshake[SESSION_ID_LEN_POS]
     sess_id = handshake[SESSION_ID_POS:SESSION_ID_POS+sess_id_len]
 
-    for user in config.USERS:
-        secret = bytes.fromhex(config.USERS[user])
+    # snapshot: config may be swapped by a reload while we iterate
+    for user, secret_hex in list(config.USERS.items()):
+        secret = bytes.fromhex(secret_hex)
 
         msg = handshake[:DIGEST_POS] + b"\x00"*DIGEST_LEN + handshake[DIGEST_POS+DIGEST_LEN:]
         computed_digest = hmac.new(secret, msg, digestmod=hashlib.sha256).digest()
@@ -1305,8 +1306,9 @@ async def handle_handshake(reader, writer):
         await handle_bad_client(reader, writer, handshake)
         return False
 
-    for user in config.USERS:
-        secret = bytes.fromhex(config.USERS[user])
+    # snapshot: config may be swapped by a reload while we iterate
+    for user, secret_hex in list(config.USERS.items()):
+        secret = bytes.fromhex(secret_hex)
 
         dec_key = hashlib.sha256(dec_prekey + secret).digest()
         decryptor = create_aes_ctr(key=dec_key, iv=int.from_bytes(dec_iv, "big"))
@@ -1781,6 +1783,12 @@ async def handle_metrics(reader, writer):
         return
 
     try:
+        # drain the request head; unread bytes at close() turn FIN into RST
+        try:
+            await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2)
+        except Exception:
+            pass
+
         metrics = []
         metrics.append(["uptime", "counter", "proxy uptime", time.time() - proxy_start_time])
         metrics.append(["connects_bad", "counter", "connects with bad secret",
@@ -2140,16 +2148,19 @@ def init_ip_info():
             disable_middle_proxy = True
 
 
-def print_tg_info():
+def print_tg_info(quiet=False):
     global my_ip_info
     global proxy_links
 
     print_default_warning = False
 
+    # shadowing emit() would make it function-local for the whole body
+    emit = (lambda *args, **kwargs: None) if quiet else print
+
     if config.PORT == 3256:
-        print("The default port 3256 is used, this is not recommended", flush=True)
+        emit("The default port 3256 is used, this is not recommended", flush=True)
         if not config.MODES["classic"] and not config.MODES["secure"]:
-            print("Since you have TLS only mode enabled the best port is 443", flush=True)
+            emit("Since you have TLS only mode enabled the best port is 443", flush=True)
         print_default_warning = True
 
     if not config.MY_DOMAIN:
@@ -2168,14 +2179,14 @@ def print_tg_info():
                 params_encoded = urllib.parse.urlencode(params, safe=':')
                 classic_link = "tg://proxy?{}".format(params_encoded)
                 proxy_links.append({"user": user, "link": classic_link})
-                print("{}: {}".format(user, classic_link), flush=True)
+                emit("{}: {}".format(user, classic_link), flush=True)
 
             if config.MODES["secure"]:
                 params = {"server": ip, "port": config.PORT, "secret": "dd" + secret}
                 params_encoded = urllib.parse.urlencode(params, safe=':')
                 dd_link = "tg://proxy?{}".format(params_encoded)
                 proxy_links.append({"user": user, "link": dd_link})
-                print("{}: {}".format(user, dd_link), flush=True)
+                emit("{}: {}".format(user, dd_link), flush=True)
 
             if config.MODES["tls"]:
                 tls_secret = "ee" + secret + config.TLS_DOMAIN.encode().hex()
@@ -2186,20 +2197,20 @@ def print_tg_info():
                 params_encoded = urllib.parse.urlencode(params, safe=':')
                 tls_link = "tg://proxy?{}".format(params_encoded)
                 proxy_links.append({"user": user, "link": tls_link})
-                print("{}: {}".format(user, tls_link), flush=True)
+                emit("{}: {}".format(user, tls_link), flush=True)
 
         if secret in ["00000000000000000000000000000000", "0123456789abcdef0123456789abcdef",
                       "00000000000000000000000000000001"]:
             msg = "The default secret {} is used, this is not recommended".format(secret)
-            print(msg, flush=True)
+            emit(msg, flush=True)
             random_secret = "".join(myrandom.choice("0123456789abcdef") for i in range(32))
-            print("You can change it to this random secret:", random_secret, flush=True)
+            emit("You can change it to this random secret:", random_secret, flush=True)
             print_default_warning = True
 
     if config.TLS_DOMAIN == "www.google.com":
-        print("The default TLS_DOMAIN www.google.com is used, this is not recommended", flush=True)
+        emit("The default TLS_DOMAIN www.google.com is used, this is not recommended", flush=True)
         msg = "You should use random existing domain instead, bad clients are proxied there"
-        print(msg, flush=True)
+        emit(msg, flush=True)
         print_default_warning = True
 
     if print_default_warning:
@@ -2222,6 +2233,26 @@ def setup_asyncio():
     asyncio.constants.LOG_THRESHOLD_FOR_CONNLOST_WRITES = 100
 
 
+main_loop = None
+reload_pending = False
+
+
+def do_reload():
+    global reload_pending
+    reload_pending = False
+    try:
+        init_config()
+        ensure_users_in_user_stats()
+        apply_upstream_proxy_settings()
+        # keep proxy_links (used by /metrics when METRICS_EXPORT_LINKS) in
+        # sync, but don't spam hundreds of tg:// lines into the journal
+        print_tg_info(quiet=True)
+        print("Config reloaded, %d users" % len(config.USERS), flush=True, file=sys.stderr)
+    except Exception:
+        print("Config reload failed, keeping previous config", flush=True, file=sys.stderr)
+        traceback.print_exc()
+
+
 def setup_signals():
     if hasattr(signal, 'SIGUSR1'):
         def debug_signal(signum, frame):
@@ -2231,12 +2262,21 @@ def setup_signals():
         signal.signal(signal.SIGUSR1, debug_signal)
 
     if hasattr(signal, 'SIGUSR2'):
+        # The handler must NOT touch config/stdout itself: a classic
+        # signal.signal() handler runs between bytecodes of whatever the
+        # loop is doing, and two SIGUSR2 in a row (the agent reloads on every
+        # peer add/remove) re-entered print() -> "RuntimeError: reentrant
+        # call inside <_io.BufferedWriter>" -> whole proxy exited.
+        # Instead just schedule do_reload() on the loop; bursts are coalesced.
         def reload_signal(signum, frame):
-            init_config()
-            ensure_users_in_user_stats()
-            apply_upstream_proxy_settings()
-            print("Config reloaded", flush=True, file=sys.stderr)
-            print_tg_info()
+            global reload_pending
+            if reload_pending:
+                return
+            reload_pending = True
+            if main_loop is not None:
+                main_loop.call_soon_threadsafe(do_reload)
+            else:
+                do_reload()
 
         signal.signal(signal.SIGUSR2, reload_signal)
 
@@ -2369,6 +2409,9 @@ def main():
 
     asyncio.set_event_loop(loop)
     loop.set_exception_handler(loop_exception_handler)
+
+    global main_loop
+    main_loop = loop
 
     utilitary_tasks = create_utilitary_tasks(loop)
     for task in utilitary_tasks:
